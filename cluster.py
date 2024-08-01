@@ -1,14 +1,21 @@
 import time
 import uuid
 from typing import List, Tuple, Dict, Any
-
-import numpy as np
+import json
+import logging
 from scipy.spatial.distance import cosine
 from firebase_admin import credentials, firestore, initialize_app
 from google.cloud.firestore_v1.vector import Vector
+from google.cloud.firestore_v1.base_query import FieldFilter
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
+from sklearn.cluster import DBSCAN
+import schedule
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -22,45 +29,60 @@ db = firestore.client()
 openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 def get_new_articles() -> List[Dict[str, Any]]:
-    print("Fetching new articles...")
+    logger.info("Fetching new articles...")
     articles = []
+    current_time = int(time.time())
+    time_threshold = current_time - (24 * 60 * 60)  # 24 hours ago in Unix timestamp
+    
     for source in db.collection('news_sources').stream():
-        query = source.reference.collection('articles').where('cluster_id', '==', -1)
+        query = (source.reference.collection('articles')
+                 .where(filter=FieldFilter("cluster_id", "==", -1))
+                 .where(filter=FieldFilter("article_published_date", ">=", time_threshold)))
         for article in query.stream():
             article_data = article.to_dict()
             article_data['id'] = article.id
             article_data['source'] = source.id
             articles.append(article_data)
-    print(f"Found {len(articles)} new articles.")
+    
+    logger.info(f"Found {len(articles)} new articles within the last 24 hours.")
     return articles
 
 def get_existing_clusters() -> List[Dict[str, Any]]:
-    print("Fetching existing clusters...")
-    clusters = [cluster.to_dict() | {'id': cluster.id} for cluster in db.collection('article_clusters').stream()]
-    print(f"Found {len(clusters)} existing clusters.")
+    logger.info("Fetching existing clusters...")
+    current_time = int(time.time())
+    time_threshold = current_time - (7 * 24 * 60 * 60)  # 7 days ago in Unix timestamp
+    
+    clusters = [
+        cluster.to_dict() | {'id': cluster.id}
+        for cluster in db.collection('article_clusters')
+        .where(filter=FieldFilter("last_updated", ">=", time_threshold))
+        .stream()
+    ]
+    
+    logger.info(f"Found {len(clusters)} existing clusters updated within the last 7 days.")
     return clusters
 
 def get_article_embedding(article: Dict[str, Any]) -> List[float]:
-    print(f"Getting embedding for article: {article['id']}")
+    logger.info(f"Getting embedding for article: {article['id']}")
     if 'article_embeddings' in article:
-        print("Using existing embedding.")
+        logger.info("Using existing embedding.")
         return article['article_embeddings']
     
     text = article['article_title'] + " "
     text += article.get('article_summary', ' '.join(p['content'] for p in article['article_content'] if p['type'] == 'paragraph'))
     
-    print("Generating new embedding using OpenAI API.")
+    logger.info("Generating new embedding using OpenAI API.")
     response = openai_client.embeddings.create(
         model="text-embedding-3-small",
         input=text.strip(),
         encoding_format="float",
         dimensions=512
     )
-    print("Embedding generated successfully.")
+    logger.info("Embedding generated successfully.")
     return response.data[0].embedding
 
-def assign_to_clusters(new_articles: List[Dict[str, Any]], existing_clusters: List[Dict[str, Any]], similarity_threshold: float = 0.8) -> Tuple[List[Tuple[Dict[str, Any], str]], List[Dict[str, Any]]]:
-    print("Assigning new articles to existing clusters...")
+def assign_to_clusters(new_articles: List[Dict[str, Any]], existing_clusters: List[Dict[str, Any]], similarity_threshold: float = 0.7) -> Tuple[List[Tuple[Dict[str, Any], str]], List[Dict[str, Any]]]:
+    logger.info("Assigning new articles to existing clusters...")
     assigned_articles = []
     unassigned_articles = []
     
@@ -74,57 +96,78 @@ def assign_to_clusters(new_articles: List[Dict[str, Any]], existing_clusters: Li
         
         if best_similarity >= similarity_threshold:
             assigned_articles.append((article, best_cluster['id']))
-            print(f"Article {article['id']} assigned to cluster {best_cluster['id']} with similarity {best_similarity:.4f}")
+            logger.info(f"Article {article['id']} assigned to cluster {best_cluster['id']} with similarity {best_similarity:.4f}")
         else:
             unassigned_articles.append(article)
-            print(f"Article {article['id']} not assigned to any cluster. Best similarity: {best_similarity:.4f}")
+            logger.info(f"Article {article['id']} not assigned to any cluster. Best similarity: {best_similarity:.4f}")
     
-    print(f"Assignment complete. {len(assigned_articles)} articles assigned, {len(unassigned_articles)} articles unassigned.")
+    logger.info(f"Assignment complete. {len(assigned_articles)} articles assigned, {len(unassigned_articles)} articles unassigned.")
     return assigned_articles, unassigned_articles
 
-def create_cluster_document(cluster_articles: List[Dict[str, Any]]) -> str:
-    print("Creating new cluster document...")
-    cluster_id = str(uuid.uuid4())
-    current_timestamp = int(time.time())
+def generate_cluster_summary(articles: List[Dict[str, Any]]) -> Dict[str, str]:
+    logger.info("Generating cluster summary...")
+    combined_text = "\n\n".join([
+        f"Title: {article['article_title']}\nContent: {' '.join(p['content'] for p in article['article_content'] if p['type'] == 'paragraph')}"
+        for article in articles
+    ])
     
-    article_refs = [db.collection('news_sources').document(article['source']).collection('articles').document(article['id']) for article in cluster_articles]
+    prompt = f"Summarize the following group of articles into a coherent summary. Provide a title for the cluster and a content summary. Respond in JSON format with keys 'cluster_title' and 'cluster_content':\n\n{combined_text}"
     
-    all_articles = [
-        {
-            'title': article['article_title'],
-            'summary': article.get('article_summary', ' '.join(p['content'] for p in article['article_content'] if p['type'] == 'paragraph'))
-        }
-        for article in cluster_articles
-    ]
+    response = openai_client.chat.completions.create(
+        model="gpt-4-1106-preview",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that summarizes groups of news articles concisely. Respond in JSON format."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={ "type": "json_object" }
+    )
     
-    print("Generating cluster embedding...")
-    combined_text = " ".join(f"{article['title']} {article['summary']}" for article in all_articles)
+    cluster_summary = json.loads(response.choices[0].message.content)
+    logger.info("Cluster summary generated successfully.")
+    return cluster_summary
+
+def generate_cluster_embedding(articles: List[Dict[str, Any]]) -> List[float]:
+    logger.info("Generating cluster embedding...")
+    combined_text = "\n\n".join([
+        f"{article['article_title']} {article.get('article_summary', ' '.join(p['content'] for p in article['article_content'] if p['type'] == 'paragraph'))}"
+        for article in articles
+    ])
     
-    response = openai_client.embeddings.create(
+    embedding_response = openai_client.embeddings.create(
         model="text-embedding-3-small",
         input=combined_text.strip(),
         encoding_format="float",
         dimensions=512
     )
-    cluster_embedding = response.data[0].embedding
+    return embedding_response.data[0].embedding
+
+def create_cluster_document(cluster_articles: List[Dict[str, Any]]) -> str:
+    logger.info("Creating new cluster document...")
+    cluster_id = str(uuid.uuid4())
+    current_timestamp = int(time.time())
     
+    article_refs = [db.collection('news_sources').document(article['source']).collection('articles').document(article['id']) for article in cluster_articles]
+    
+    cluster_summary = generate_cluster_summary(cluster_articles)
+    cluster_embedding = generate_cluster_embedding(cluster_articles)
     cluster_data = {
         f'articles_{current_timestamp}': article_refs,
         'cluster_embedding': Vector(cluster_embedding),
-        'last_updated': current_timestamp
+        'last_updated': current_timestamp,
+        'cluster_title': cluster_summary['cluster_title'],
+        'cluster_content': cluster_summary['cluster_content']
     }
     
     db.collection('article_clusters').document(cluster_id).set(cluster_data)
-    print(f"New cluster created with ID: {cluster_id}")
+    logger.info(f"New cluster created with ID: {cluster_id}")
     return cluster_id
-
 def update_article_with_cluster(article: Dict[str, Any], cluster_id: str):
-    print(f"Updating article {article['id']} with cluster ID: {cluster_id}")
+    logger.info(f"Updating article {article['id']} with cluster ID: {cluster_id}")
     db.collection('news_sources').document(article['source']).collection('articles').document(article['id']).update({'cluster_id': cluster_id})
-    print("Article updated successfully.")
+    logger.info("Article updated successfully.")
 
 def update_existing_cluster(cluster_id: str, new_article: Dict[str, Any]):
-    print(f"Updating existing cluster: {cluster_id}")
+    logger.info(f"Updating existing cluster: {cluster_id}")
     cluster_ref = db.collection('article_clusters').document(cluster_id)
     cluster_data = cluster_ref.get().to_dict()
     
@@ -132,70 +175,81 @@ def update_existing_cluster(cluster_id: str, new_article: Dict[str, Any]):
     current_timestamp = int(time.time())
     
     if not any(new_article_ref in refs for refs in cluster_data.values() if isinstance(refs, list)):
-        print("Adding new article reference to the cluster.")
+        logger.info("Adding new article reference to the cluster.")
         timestamp_key = f'articles_{current_timestamp}'
         cluster_data.setdefault(timestamp_key, []).append(new_article_ref)
     else:
-        print("Article reference already exists in the cluster. Skipping addition.")
+        logger.info("Article reference already exists in the cluster. Skipping addition.")
     
-    print("Fetching all articles in the cluster...")
-    all_articles = [get_article_info(ref) for refs in cluster_data.values() if isinstance(refs, list) for ref in refs if get_article_info(ref)]
+    logger.info("Fetching all articles in the cluster...")
+    processed_article_ids = set()
+    all_articles = []
     
-    print("Generating new cluster embedding...")
-    combined_text = " ".join(f"{article['title']} {article['summary']}" for article in all_articles)
+    for refs in cluster_data.values():
+        if isinstance(refs, list):
+            for ref in refs:
+                article_id = ref.id
+                if article_id not in processed_article_ids:
+                    article_info = get_article_info(ref)
+                    if article_info:
+                        all_articles.append(article_info)
+                        processed_article_ids.add(article_id)
     
-    response = openai_client.embeddings.create(
-        model="text-embedding-3-small",
-        input=combined_text.strip(),
-        encoding_format="float",
-        dimensions=512
-    )
-    new_cluster_embedding = response.data[0].embedding
+    if new_article['id'] not in processed_article_ids:
+        all_articles.append(new_article)
     
-    cluster_data['cluster_embedding'] = Vector(new_cluster_embedding)
-    cluster_data['last_updated'] = current_timestamp
+    cluster_summary = generate_cluster_summary(all_articles)
+    cluster_embedding = generate_cluster_embedding(all_articles)
+    
+    cluster_data.update({
+        'cluster_embedding': Vector(cluster_embedding),
+        'last_updated': current_timestamp,
+        'cluster_title': cluster_summary['cluster_title'],
+        'cluster_content': cluster_summary['cluster_content']
+    })
     
     cluster_ref.set(cluster_data)
-    print("Cluster updated successfully with new embedding and timestamp.")
-
-def get_article_info(article_ref) -> Dict[str, str]:
-    print(f"Fetching article info for {article_ref.id}")
+    logger.info("Cluster updated successfully with new embedding, summary, and timestamp.")
+def get_article_info(article_ref) -> Dict[str, Any]:
+    logger.info(f"Fetching article info for {article_ref.id}")
     article_doc = article_ref.get()
     if article_doc.exists:
         article_data = article_doc.to_dict()
         return {
-            'title': article_data['article_title'],
-            'summary': article_data.get('article_summary', ' '.join(p['content'] for p in article_data['article_content'] if p['type'] == 'paragraph'))
+            'article_title': article_data['article_title'],
+            'article_content': article_data['article_content'],
+            'article_summary': article_data.get('article_summary', ''),
+            'id': article_doc.id,
+            'source': article_ref.parent.parent.id
         }
-    print("Article not found.")
+    logger.info("Article not found.")
     return {}
 
 def main():
-    print("Starting main clustering process...")
+    logger.info("Starting main clustering process...")
     new_articles = get_new_articles()
     if not new_articles:
-        print("No new articles found. Exiting.")
+        logger.info("No new articles found. Exiting.")
         return
 
     existing_clusters = get_existing_clusters()
     
     if existing_clusters:
-        print("First stage: Assigning to existing clusters")
+        logger.info("First stage: Assigning to existing clusters")
         assigned_articles, unassigned_articles = assign_to_clusters(new_articles, existing_clusters)
         
         for article, cluster_id in assigned_articles:
             update_article_with_cluster(article, cluster_id)
             update_existing_cluster(cluster_id, article)
         
-        print(f"{len(assigned_articles)} articles assigned to existing clusters.")
+        logger.info(f"{len(assigned_articles)} articles assigned to existing clusters.")
     else:
-        print("No existing clusters found.")
+        logger.info("No existing clusters found.")
         unassigned_articles = new_articles
     
-    print("Second stage: Clustering remaining articles")
+    logger.info("Second stage: Clustering remaining articles")
     if unassigned_articles:
         unassigned_embeddings = [get_article_embedding(article) for article in unassigned_articles]
-        from sklearn.cluster import DBSCAN
         clusters = DBSCAN(eps=0.2, min_samples=2, metric='cosine').fit_predict(unassigned_embeddings)
         
         for cluster_label in set(clusters) - {-1}:
@@ -205,11 +259,19 @@ def main():
                 for article in cluster_articles:
                     update_article_with_cluster(article, cluster_id)
         
-        print(f"{len(set(clusters)) - (1 if -1 in clusters else 0)} new clusters created from {len(unassigned_articles)} unassigned articles.")
+        logger.info(f"{len(set(clusters)) - (1 if -1 in clusters else 0)} new clusters created from {len(unassigned_articles)} unassigned articles.")
     else:
-        print("No new clusters created.")
+        logger.info("No new clusters created.")
 
-    print("Clustering process completed.")
+    logger.info("Clustering process completed.")
+
+def run_scheduler():
+    logger.info("Starting the scheduler. The script will run every hour.")
+    schedule.every(10).seconds.do(main)
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 if __name__ == "__main__":
-    main()
+    run_scheduler()
