@@ -111,15 +111,16 @@ def generate_cluster_summary(articles: List[Dict[str, Any]]) -> Dict[str, str]:
         for article in articles
     ])
     
-    prompt = f"Summarize the following group of articles into a coherent summary. Provide a title for the cluster and a content summary. Respond in JSON format with keys 'cluster_title' and 'cluster_content':\n\n{combined_text}"
+    prompt = f"Krijo një artikull lajmesh të shkruar mirë dhe gjatë duke u bazuar një grup artikujsh të mëposhtëm.Përdor markdown. Mos lini detaje pa përfshirë. Sigurohu që artikulli të ketë një titull dhe një përmbledhje të qartë dhe të plotësuar. Titulli dhe përmbledhja duhet të jenë të bindshme dhe tërheqëse për lexuesit. Pergjigju ne formatin JSON me celsat 'cluster_title' dhe 'cluster_content'. 'cluster_title' dhe 'cluster_content' duhet te jene gjithmone te ndara nga njera tjetra duke mos pasur mbivendosje. :\n\n{combined_text}"
     
     response = openai_client.chat.completions.create(
-        model="gpt-4-1106-preview",
+        model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant that summarizes groups of news articles concisely. Respond in JSON format."},
+            {"role": "system", "content": "Ju jeni një gazetar virtual i talentuar,i paanshem, i cili është specializuar në shkrimin e artikujve lajmesh tërheqës dhe të plotë. Ju keni një stil shkrimi tërheqës dhe profesional. Pergjigju ne formatin JSON."},
             {"role": "user", "content": prompt}
         ],
-        response_format={ "type": "json_object" }
+        response_format={ "type": "json_object" },
+        temperature=0.5
     )
     
     cluster_summary = json.loads(response.choices[0].message.content)
