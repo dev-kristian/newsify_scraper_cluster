@@ -44,7 +44,7 @@ This project is a comprehensive news aggregation and clustering system that scra
    - `FIREBASE_CRED_PATH`: Path to your Firebase credentials JSON file
 4. Run the main script:
    ```
-   python main.py
+   python run_spiders.py
    ```
 
 ## Configuration
